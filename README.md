@@ -35,6 +35,8 @@ For threading application, one would need to enable `-mt` flag to make the tool 
 <path to the Pin ELF> -pid <pid of the app. to be attach to> -t obj-intel64/hotpathFinder.so -mt
 ```
 
+Once the tool is attached to the application, one would need to put some loading to the application if it's idling at the time, i.e. the tool can't make progress if the application is idling. It's noteworthy that due to our profiling mechanism, only run through the hotpath once (e.g. single HTTP request) is not enough to finish the profiling, and twice is enough currently.
+
 After profiling, the resulting file (profiling result) can be found at directory where the application is started. Meanwhile, the tool would detach from the application, which means that the application would execute on its own behalf since then.
 
 Unfortunately, the tool can't get correct hotpath by starting the application with Pin for now, it's because of bad hotpath finding mechanism. The mechanism we use currently is recording the backtrace of each syscall, after each recording, we check whether we have duplicated backtrace existed, if it does, we consider the hotpath is found. However, at least CRT (C runtime) has such scenario at application loading stage, which makes the tool to get wrong hotpath. Therefore, we can only use attach mode to attach to the target application currently.
