@@ -30,19 +30,30 @@ sudo sh -c 'echo 0 > /proc/sys/kernel/yama/ptrace_scope'
 ```
 (Be aware that this would enable unprivileged process to do malicious injection to other processes.)
 
-For threading application, one would need to enable `-mt` flag to make the tool works properly:
-```
-<path to the Pin ELF> -pid <pid of the app. to be attach to> -t obj-intel64/hotpathFinder.so -mt
-```
+### Options
+- `mt`
+
+    For threading application, one would need to enable `-mt` flag to make the tool works properly:
+    ```
+    <path to the Pin ELF> -pid <pid of the app. to attach> -t obj-intel64/hotpathFinder.so -mt
+    ```
+    or
+    ```
+    <path to the Pin ELF> -t obj-intel64/hotpathFinder.so -mt -- <application to start>
+    ```
+
+- `retval`
+
+    Syscall-retval-reference checking can be enabled by specifying `-retval` flag.
 
 Once the tool is attached to the application, one would need to put some loading to the application if it's idling at the time, i.e. the tool can't make progress if the application is idling. It's noteworthy that due to our profiling mechanism, only run through the hotpath once (e.g. single HTTP request) is not enough to finish the profiling, and twice is enough currently.
 
 After profiling, the resulting file (profiling result) can be found at directory where the application is started. Meanwhile, the tool would detach from the application, which means that the application would execute on its own behalf since then.
 
-Unfortunately, the tool can't get correct hotpath by starting the application with Pin for now, it's because of bad hotpath finding mechanism. The mechanism we use currently is recording the backtrace of each syscall, after each recording, we check whether we have duplicated backtrace existed, if it does, we consider the hotpath is found. However, at least CRT (C runtime) has such scenario at application loading stage, which makes the tool to get wrong hotpath. Therefore, we can only use attach mode to attach to the target application currently.
+Unfortunately, the tool can't get correct hotpath by starting the application with Pin for now, it's because of bad hotpath finding mechanism. The mechanism we use currently is recording the backtrace of each syscall, after each recording, we check whether we have duplicated backtrace existed, if it does, we consider the hotpath is found. However, at least CRT (C runtime) has such scenario at application loading stage, which makes the tool to get wrong hotpath. Therefore, we can only use attach mode profile the target application currently.
 
 ## Adding new syscall
-Due to each syscall has different sequence of pointer param (if any), the tool currently uses a cumbersome (hard-coded) mechanism for supported syscall. In order to add new syscall, one would require:
+As each syscall has different sequence of pointer param (if any), the tool currently uses a cumbersome (hard-coded) mechanism for supported syscall. In order to add new syscall, one would require:
 1. add target syscall number into array named `whitelistedSyscall`.
 2. add new `case` into `chkMemRefBySyscall`, the constant integer stands for the seq. of the param of the syscall starting from zero.
 3. add new `case` into `addMemRefTarget`, to be specific:
@@ -52,23 +63,29 @@ Due to each syscall has different sequence of pointer param (if any), the tool c
     - `break` the case.
 
 ## TODOs
-- syscall retval dependency is currently not tracked by the tool.
 - Better hotpath finding mechanism is required as current one may captures unwanted code path.
 ## Example output
-With Nginx as profiling target: (application logic inside Nginx also suffered from the aforementioned deficiency, which causes missing of 3 syscalls in the hotpath)
+With Nginx as profiling target:
+
+- application logic inside Nginx also suffered from the aforementioned deficiency, which causes missing of 3 syscalls in the hotpath.
+- `cLoc` stands for syscall location in our buffer, it's also the syscall sequence in the hotpath.
+- `cSpan` stands for how many syscalls specific candidate covers.
+
 ```
 app. thread ID 0 is now running
-There are totally 11 syscall(s) found within the hotpath.
+
+There are totally 11 syscalls found within the hotpath.
 First stage prune (filter out syscalls that don't exist in the whitelist):
 cand. #0 has cLoc: 0, cSpan: 7
 cand. #1 has cLoc: 8, cSpan: 3
 
-Second stage prune (filter out syscalls that have ptr param refcnt > 0):
-cLoc: 5 has memref count of 1
-cLoc: 2 has memref count of 2
+Second stage prune (filter out syscalls that have refcnt of ptr param and syscall retval > 0):
+cLoc:5 has memref count of 1
+cLoc:2 has memref count of 2
 new candidate (#2) has cLoc: 3, cSpan: 2
-cLoc: 1 has memref count of 6
-After pruning, we got 3 candidate(s) for doing syscall batching
+cLoc:1 has memref count of 6
+
+After pruning, we got 3 candidate(s) for doing syscall batching:
 
 candidate #0 has too few syscalls for batching.
 

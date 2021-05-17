@@ -23,8 +23,11 @@
 
 std::ofstream outFile;
 
-KNOB<BOOL> KnobThreading(KNOB_MODE_WRITEONCE,   "pintool", "mt", "0",
+KNOB<BOOL> KnobThreading(KNOB_MODE_WRITEONCE, "pintool", "mt", "0",
            "whether the target app. is a threading application");
+KNOB<BOOL> KnobRetvalChecking(KNOB_MODE_WRITEONCE, "pintool", "retval", "0",
+        "whether the syscall retval checking is enabled (disabled if not "
+        "specified)");
 
 /*
  * TODO: all of the global vars should be malloc-ed, since PIN doesn't free
@@ -42,7 +45,7 @@ KNOB<BOOL> KnobThreading(KNOB_MODE_WRITEONCE,   "pintool", "mt", "0",
  * would require to update this list, `chkMemRefBySyscall` and `addMemRefTarget`
  * manually in order to add new syscall.
  */
-const UINT16 whitelistedSyscall[] = {
+static const UINT16 whitelistedSyscall[] = {
     __NR_epoll_wait,
     __NR_accept4,
     __NR_recvfrom,
@@ -58,7 +61,11 @@ const UINT16 whitelistedSyscall[] = {
 };
 
 struct candidateInfo {
-    int cLoc; /* location of first syscall of the candidate in the `bt.head` */
+    /*
+     * location of first syscall of the candidate in the `head` of `struct
+     * backtraceInfo`
+     */
+    int cLoc;
 
     /* number of syscalls the span covered starting from `cLoc` */
     int cSpan;
@@ -107,10 +114,21 @@ struct hotpathCandidate {
     int nrC; /* # of used candidate (`candInfo`) */
     int curIdx; /* for indexing `candInfo` */
     bool isPruneSecondStageDone;
+
+    /*
+     * this flag can be set iff second prune stage is entered, it's used to
+     * detect whether retval of specific syscall is saved by application logic.
+     * If it's saved, then corresponding refcnt is incremented.
+     *
+     * the flag is reset once a rax-clobbered instruction is encountered, i.e.
+     * the retval is no longer exists in rax.
+     */
+    bool isRetvalAlive;
 };
-struct hotpathCandidate hc = {.nrC = 0,
-                              .curIdx = 0,
-                              .isPruneSecondStageDone = false
+static struct hotpathCandidate hc = {.nrC = 0,
+                                     .curIdx = 0,
+                                     .isPruneSecondStageDone = false,
+                                     .isRetvalAlive = false,
 };
 
 struct backtraceInfo {
@@ -130,10 +148,10 @@ struct backtraceInfo {
     OS_THREAD_ID targetTid;
 };
 
-struct backtraceInfo bt = {.idx = 0,
-                            .isInPruneSecondStage = false,
-                            .isThreadingApp = false,
-                            .targetTid = INVALID_OS_THREAD_ID,
+static struct backtraceInfo bt = {.idx = 0,
+                                  .isInPruneSecondStage = false,
+                                  .isThreadingApp = false,
+                                  .targetTid = INVALID_OS_THREAD_ID,
 };
 
 static bool isBacktraceExisted(int nr_func)
@@ -173,15 +191,16 @@ static void dumpHotpath(void)
     if (hc.isPruneSecondStageDone) {
         char **head;
         PIN_LockClient(); /* required by backtrace_symbols() */
-        outFile << "After pruning, we got " << hc.nrC
-             << " candidate(s) for doing syscall batching\n\n";
+        outFile << "\nAfter pruning, we got " << hc.nrC
+                << " candidate(s) for doing syscall batching:\n\n";
         for (int i = 0; i < hc.nrC; i++) {
             if (!hc.candInfo[i].isBatchable) {
-                outFile << "candidate #" << i << " has too few syscalls for batching.\n\n";
+                outFile << "candidate #" << i << " has too few syscalls for "
+                        << "batching.\n\n";
                 continue;
             }
-            outFile << "candidate #" << i << " contains " << hc.candInfo[i].cSpan
-                 << " syscalls\n\n";
+            outFile << "candidate #" << i << " contains "
+                    << hc.candInfo[i].cSpan << " syscalls.\n\n";
             for (int x = 0; x < hc.candInfo[i].cSpan; x++) {
                 int sysIdx = hc.candInfo[i].cLoc + x;
                 outFile << "syscall #" << x << " has backtrace:\n";
@@ -195,7 +214,7 @@ static void dumpHotpath(void)
         }
         PIN_UnlockClient();
     } else
-        outFile << "There are totally " << bt.idx - bt.hotpathStart << " syscall(s) found within the hotpath." << "\n";
+        outFile << "\nThere are totally " << bt.idx - bt.hotpathStart << " syscalls found within the hotpath.\n";
 }
 
 static inline bool isSyscallBlacklisted(UINT16 sysnum)
@@ -498,6 +517,19 @@ static void syscallEntryCb(THREADID threadIndex, CONTEXT *ctxt,
          * do this by injecting syscall-specific detection callback.
          */
         addMemRefTarget(ctxt, std);
+
+        /*
+         * after syscall returns, this makes related routine to check whether
+         * there exists an instruction which reads un-clobbered eax (i.e.
+         * syscall retval).
+         *
+         * the reason why checking syscall retval dependency at the second stage
+         * is that the check shares the same refcnt, which is driven by index
+         * which only get used at second stage. Thus, this saves additional
+         * logic for resetting the index.
+         */
+        hc.isRetvalAlive = true;
+
         return;
     }
 
@@ -541,6 +573,8 @@ static void syscallEntryCb(THREADID threadIndex, CONTEXT *ctxt,
          */
         addMemRefTarget(ctxt, std);
 
+        hc.isRetvalAlive = true;
+
         return;
     }
 
@@ -559,12 +593,12 @@ static void syscallEntryCb(THREADID threadIndex, CONTEXT *ctxt,
  */
 static void pruneSecondStage(void)
 {
-    outFile << "Second stage prune (filter out syscalls that have ptr param refcnt "
-         << "> 0):\n";
+    outFile << "Second stage prune (filter out syscalls that have refcnt of "
+            << "ptr param and syscall retval > 0):\n";
     for (int i = hc.nrC - 1; i >= 0 ; i--) {
         for (int x = hc.candInfo[i].curIdx - 1; x >= 0; x--) {
             if (hc.candInfo[i].memRefCnt[x] > 0) {
-                outFile << "cLoc: " << hc.candInfo[i].cLoc + x 
+                outFile << "cLoc:" << hc.candInfo[i].cLoc + x 
                      << " has memref count of " << hc.candInfo[i].memRefCnt[x]
                      << "\n";
                 if ((x + 1) == hc.candInfo[i].curIdx) {
@@ -617,19 +651,38 @@ static void pruneSecondStage(void)
     }
 }
 
-static void memRefDetector(ADDRINT readAddr)
+/*
+ * check whether second stage profiling has finished, if it did, start epilog
+ * tasks and register for detachment from the application.
+ *
+ * note that since the detachment doesn't happen synchronously, any
+ * instrumentation, analysis or callback routines are possible to get invoked
+ * after the detachment has issued. In light of this, if any accident occurs
+ * after the hotpath is dumped, one can suspect that it's caused by this.
+ * However, I haven't ran into such issue so far. If this indeed happens, the
+ * fix would be add some logic to corresponding routines to check whether the
+ * tool has entered the epilog stage.
+ */
+static inline bool isSecondStageProfilingDone(void)
 {
-    if (!isEnterable())
-        return;
-
     if ((hc.nrC != 0) && (hc.curIdx == hc.nrC)) {
         pruneSecondStage();
         hc.isPruneSecondStageDone = true;
         dumpHotpath();
         outFile << "Detaching from the application..." << std::endl;
         PIN_Detach();
-        return;
+        return true;
     }
+    return false;
+}
+
+static void memRefDetector(ADDRINT readAddr)
+{
+    if (!isEnterable())
+        return;
+
+    if(isSecondStageProfilingDone())
+        return;
 
     struct candidateInfo *curC = &hc.candInfo[hc.curIdx];
 
@@ -638,6 +691,37 @@ static void memRefDetector(ADDRINT readAddr)
             if (readAddr == curC->ptrArgBuf[i][z])
                 curC->memRefCnt[i]++;
         }
+    }
+}
+
+/* check whether the retval is saved by application logic, if it does, increment
+ * refcnt of corresponding syscall.
+ *
+ * @isRead indidate instruction triggering this routine is reading or writing
+ * EAX register (i.e. syscall retval).
+ */
+static void retvalRefDetector(bool isRead)
+{
+    if (!bt.isInPruneSecondStage)
+        return;
+
+    if(isSecondStageProfilingDone())
+        return;
+
+    if (isRead) {
+        if (!hc.isRetvalAlive)
+            return; /* syscall retval has been clobbered */
+
+        /*
+         * increment refcnt of corresponding syscall in the candidate.
+         *
+         * it's possible to get negative index
+         */
+        if (curCand.curIdx - 1 >= 0)
+            curCand.memRefCnt[curCand.curIdx - 1]++;
+    } else { /* the instruction is a write instruction */
+        /* disable the flag as EAX is about to be clobbered */
+        hc.isRetvalAlive = false;
     }
 }
 
@@ -692,6 +776,31 @@ static void detachCb(void *v)
     /* free up memory here */
 }
 
+/*
+ * only add analysis routine to instructions that lays inside the main
+ * executable. Without such filtering, syscall wrappers (e.g. provided by
+ * glibc) that access the retval would interfere the accounting of the
+ * memory reference count.
+ */
+static void TraceInstrument(TRACE trace, void *v)
+{
+    for (BBL bbl = TRACE_BblHead(trace); BBL_Valid(bbl); bbl = BBL_Next(bbl)) {
+        for(INS ins = BBL_InsHead(bbl); INS_Valid(ins); ins = INS_Next(ins)) {
+            if (IMG_IsMainExecutable(SEC_Img(RTN_Sec(INS_Rtn(ins))))) {
+                if (INS_RegRContain(ins, REG_EAX))
+                INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(retvalRefDetector),
+                                IARG_BOOL, true,
+                                IARG_END);
+
+                if (INS_RegWContain(ins, REG_EAX))
+                    INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(retvalRefDetector),
+                                    IARG_BOOL, false,
+                                    IARG_END);
+            }
+        }
+    }
+}
+
 int main(int argc, char *argv[])
 {
     if (PIN_Init(argc, argv)) {
@@ -702,6 +811,8 @@ int main(int argc, char *argv[])
     outFile.open(OUTPUT_FILENAME);
 
     //toolInit();
+    if (KnobRetvalChecking)
+        TRACE_AddInstrumentFunction(TraceInstrument, 0);
     PIN_AddThreadStartFunction(ThreadStartCb, 0);
     PIN_AddSyscallEntryFunction(syscallEntryCb, NULL);
     INS_AddInstrumentFunction(insInstrument, 0);
